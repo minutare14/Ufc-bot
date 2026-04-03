@@ -1,6 +1,8 @@
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import aiohttp
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -27,6 +29,7 @@ PORT = int(os.getenv("PORT", "8765"))
 UFC_ICS_URL = (
     "https://raw.githubusercontent.com/clarencechaan/ufc-cal/ics/UFC.ics"
 )
+SP_TZ = ZoneInfo("America/Sao_Paulo")
 
 HEADERS = {
     "User-Agent": (
@@ -40,15 +43,15 @@ HEADERS = {
 
 
 # ---------------------------------------------------------------------------
-# HTTP helper
+# HTTP helpers
 # ---------------------------------------------------------------------------
 
 
-async def fetch_text(url: str) -> str | None:
+async def fetch_text(url: str, timeout: int = 15) -> str | None:
     try:
         async with aiohttp.ClientSession(headers=HEADERS) as session:
             async with session.get(
-                url, timeout=aiohttp.ClientTimeout(total=15)
+                url, timeout=aiohttp.ClientTimeout(total=timeout)
             ) as resp:
                 logger.info("GET %s → %s", url, resp.status)
                 if resp.status == 200:
@@ -59,18 +62,48 @@ async def fetch_text(url: str) -> str | None:
     return None
 
 
+async def fetch_event_image(event_url: str) -> str | None:
+    """Extrai og:image da página do evento (timeout curto para não travar)."""
+    if not event_url or not event_url.startswith("http"):
+        return None
+    html = await fetch_text(event_url, timeout=5)
+    if not html:
+        return None
+    for pattern in (
+        r'property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+        r'content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+    ):
+        m = re.search(pattern, html, re.IGNORECASE)
+        if m:
+            url = m.group(1)
+            logger.info("og:image: %s", url)
+            return url
+    return None
+
+
 # ---------------------------------------------------------------------------
-# iCalendar parser (sem dependência externa)
+# Timezone helper
+# ---------------------------------------------------------------------------
+
+
+def fmt_sp(dt: datetime) -> str:
+    """Converte UTC para horário de São Paulo e formata."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt_sp = dt.astimezone(SP_TZ)
+    return dt_sp.strftime("%d/%m/%Y %H:%M (Brasília)")
+
+
+# ---------------------------------------------------------------------------
+# iCalendar parser (stdlib puro)
 # ---------------------------------------------------------------------------
 
 
 def _parse_ics_datetime(value: str) -> datetime | None:
-    """Parseia DTSTART do formato iCal: 20260405T000000Z ou 20260405."""
     value = value.strip()
     for fmt in ("%Y%m%dT%H%M%SZ", "%Y%m%dT%H%M%S", "%Y%m%d"):
         try:
-            dt = datetime.strptime(value, fmt)
-            return dt.replace(tzinfo=timezone.utc)
+            return datetime.strptime(value, fmt).replace(tzinfo=timezone.utc)
         except ValueError:
             pass
     return None
@@ -80,69 +113,23 @@ def _unescape_ics(value: str) -> str:
     return value.replace("\\,", ",").replace("\\n", "\n").replace("\\;", ";")
 
 
-def parse_ics(content: str) -> list[dict]:
-    """Parseia o arquivo .ics e retorna lista de eventos ordenados por data."""
-    events = []
-    current: dict | None = None
-
-    for raw_line in content.splitlines():
-        line = raw_line.rstrip()
-
-        # Linha de continuação (começa com espaço ou tab)
-        if current is not None and raw_line and raw_line[0] in (" ", "\t"):
-            last_key = current.get("__last_key")
-            if last_key:
-                current[last_key] = current[last_key] + line.strip()
-            continue
-
-        if line == "BEGIN:VEVENT":
-            current = {}
-        elif line == "END:VEVENT" and current is not None:
-            events.append(current)
-            current = None
-        elif current is not None and ":" in line:
-            key, _, value = line.partition(":")
-            # Remove parâmetros (ex: DTSTART;TZID=America/New_York → DTSTART)
-            key = key.split(";")[0].strip()
-            current[key] = value.strip()
-            current["__last_key"] = key
-
-    result = []
-    for ev in events:
-        title = _unescape_ics(ev.get("SUMMARY", "Evento UFC"))
-        dtstart_raw = ev.get("DTSTART", "")
-        event_date = _parse_ics_datetime(dtstart_raw)
-        location = _unescape_ics(ev.get("LOCATION", "A confirmar"))
-        description = _unescape_ics(ev.get("DESCRIPTION", ""))
-        link = _unescape_ics(ev.get("UID", ""))
-
-        fights = _parse_fights_from_description(description)
-
-        result.append(
-            {
-                "title": title,
-                "date": event_date,
-                "date_str": event_date.strftime("%d/%m/%Y") if event_date else dtstart_raw,
-                "location": location,
-                "link": link,
-                "description": description,
-                "fights": fights,
-            }
-        )
-
-    result.sort(key=lambda e: e["date"] or datetime.max.replace(tzinfo=timezone.utc))
-    logger.info("ICS: %d eventos parseados", len(result))
-    return result
-
-
 def _parse_fights_from_description(desc: str) -> list[dict]:
-    """Extrai lutas da DESCRIPTION do .ics (formato: '• Lutador A vs. Lutador B @peso')."""
+    """Extrai todas as lutas do card separando Main Card de Prelims."""
     fights = []
+    section = "main"
     for line in desc.splitlines():
-        line = line.strip().lstrip("•").strip()
-        if " vs. " not in line:
+        stripped = line.strip()
+        lower = stripped.lower()
+        if "prelim" in lower and "vs." not in lower:
+            section = "prelim"
             continue
-        parts = line.split(" vs. ", 1)
+        if "main card" in lower and "vs." not in lower:
+            section = "main"
+            continue
+        fight_line = stripped.lstrip("•").strip()
+        if " vs. " not in fight_line:
+            continue
+        parts = fight_line.split(" vs. ", 1)
         if len(parts) != 2:
             continue
         red = parts[0].strip()
@@ -154,20 +141,68 @@ def _parse_fights_from_description(desc: str) -> list[dict]:
             weight = weight.strip()
         else:
             blue = blue_weight
-        title_fight = "(C)" in red or "(C)" in blue
         fights.append(
             {
                 "red": red[:60],
                 "blue": blue[:60],
                 "weight": weight,
-                "title_fight": title_fight,
+                "title_fight": "(C)" in red or "(C)" in blue,
+                "section": section,
             }
         )
     return fights
 
 
+def parse_ics(content: str) -> list[dict]:
+    events = []
+    current: dict | None = None
+
+    for raw_line in content.splitlines():
+        line = raw_line.rstrip()
+        if current is not None and raw_line and raw_line[0] in (" ", "\t"):
+            last_key = current.get("__last_key")
+            if last_key:
+                current[last_key] = current[last_key] + line.strip()
+            continue
+        if line == "BEGIN:VEVENT":
+            current = {}
+        elif line == "END:VEVENT" and current is not None:
+            events.append(current)
+            current = None
+        elif current is not None and ":" in line:
+            key, _, value = line.partition(":")
+            key = key.split(";")[0].strip()
+            current[key] = value.strip()
+            current["__last_key"] = key
+
+    result = []
+    for ev in events:
+        title = _unescape_ics(ev.get("SUMMARY", "Evento UFC"))
+        event_date = _parse_ics_datetime(ev.get("DTSTART", ""))
+        location = _unescape_ics(ev.get("LOCATION", "A confirmar"))
+        description = _unescape_ics(ev.get("DESCRIPTION", ""))
+        link = _unescape_ics(ev.get("UID", ""))
+        fights = _parse_fights_from_description(description)
+        result.append(
+            {
+                "title": title,
+                "date": event_date,
+                "date_str": event_date.strftime("%d/%m/%Y") if event_date else "",
+                "location": location,
+                "link": link,
+                "fights": fights,
+            }
+        )
+
+    result.sort(
+        key=lambda e: e["date"] or datetime.max.replace(tzinfo=timezone.utc)
+    )
+    logger.info("ICS: %d eventos parseados", len(result))
+    return result
+
+
 # ---------------------------------------------------------------------------
-# Busca de eventos e filtro de fim de semana
+# Busca e filtro
 # ---------------------------------------------------------------------------
 
 
@@ -177,7 +212,7 @@ async def get_events() -> list[dict]:
         events = parse_ics(content)
         if events:
             return events
-    logger.error("Nao foi possivel obter eventos do calendario ICS.")
+    logger.error("Nao foi possivel obter o calendario ICS.")
     return []
 
 
@@ -187,7 +222,6 @@ def filter_weekend_events(events: list[dict]) -> list[dict]:
     days_until_saturday = (5 - today.weekday()) % 7 or 7
     next_saturday = today + timedelta(days=days_until_saturday)
     next_sunday = next_saturday + timedelta(days=1)
-
     logger.info("FDS buscado: %s a %s", next_saturday, next_sunday)
 
     def norm(e: dict) -> datetime | None:
@@ -200,16 +234,13 @@ def filter_weekend_events(events: list[dict]) -> list[dict]:
         e for e in events
         if norm(e) and next_saturday <= norm(e).date() <= next_sunday
     ]
-
     if not weekend:
         logger.info("Sem evento no FDS — mostrando próximo(s)")
         weekend = [e for e in events if norm(e) and norm(e) >= now_utc][:3]
-
     return weekend
 
 
 def search_fighter(name: str, events: list[dict]) -> list[dict]:
-    """Busca lutador nos cards já carregados (sem HTTP extra)."""
     name_lower = name.lower()
     found = []
     for ev in events:
@@ -220,6 +251,42 @@ def search_fighter(name: str, events: list[dict]) -> list[dict]:
             ):
                 found.append({"event": ev, "fight": fight})
     return found
+
+
+# ---------------------------------------------------------------------------
+# Formatação do card completo
+# ---------------------------------------------------------------------------
+
+
+def build_card_text(ev: dict) -> str:
+    """Monta o texto completo do card com todas as lutas."""
+    fights = ev.get("fights", [])
+    main = [f for f in fights if f["section"] == "main"]
+    prelims = [f for f in fights if f["section"] == "prelim"]
+
+    date_str = fmt_sp(ev["date"]) if ev.get("date") else ev.get("date_str", "?")
+
+    text = (
+        f"*{ev['title']}*\n"
+        f"Data: {date_str}\n"
+        f"Local: {ev['location']}\n"
+    )
+
+    if main:
+        text += "\n*Main Card*\n"
+        for f in main:
+            belt = " C" if f["title_fight"] else ""
+            w = f" @{f['weight']}" if f["weight"] else ""
+            text += f"• {f['red']} vs {f['blue']}{belt}{w}\n"
+
+    if prelims:
+        text += "\n*Prelims*\n"
+        for f in prelims:
+            w = f" @{f['weight']}" if f["weight"] else ""
+            text += f"• {f['red']} vs {f['blue']}{w}\n"
+
+    text += f"\n[Ver card completo]({ev['link']})"
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +310,42 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def _send_event_card(
+    update: Update, ev: dict, show_image: bool = True
+) -> None:
+    """Envia um evento completo: imagem (se disponível) + card com todas as lutas."""
+    card_text = build_card_text(ev)
+
+    image_url = await fetch_event_image(ev["link"]) if show_image else None
+
+    if image_url:
+        try:
+            # Caption limitado a 1024 chars pelo Telegram
+            caption = card_text[:1024]
+            await update.effective_message.reply_photo(
+                photo=image_url,
+                caption=caption,
+                parse_mode="Markdown",
+            )
+            # Se o card foi cortado, envia o resto como mensagem separada
+            if len(card_text) > 1024:
+                await update.effective_message.reply_text(
+                    card_text[1024:],
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True,
+                )
+            return
+        except Exception as exc:
+            logger.warning("Falha ao enviar foto, fallback texto: %s", exc)
+
+    # Fallback sem imagem
+    await update.effective_message.reply_text(
+        card_text,
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+    )
+
+
 async def cmd_fds(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.effective_message.reply_text(
         "Buscando eventos do fim de semana..."
@@ -258,26 +361,9 @@ async def cmd_fds(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("Nenhum evento no proximo fim de semana.")
         return
 
-    text = "*Eventos UFC — Proximo Fim de Semana*\n\n"
+    await msg.delete()
     for ev in weekend:
-        date = ev["date"].strftime("%d/%m/%Y %H:%M UTC") if ev.get("date") else ev["date_str"]
-        fights_preview = ""
-        main_fights = [f for f in ev.get("fights", [])[:3]]
-        for f in main_fights:
-            belt = " C" if f["title_fight"] else ""
-            fights_preview += f"  • {f['red']} vs {f['blue']}{belt}\n"
-
-        text += (
-            f"*{ev['title']}*\n"
-            f"Data: {date}\n"
-            f"Local: {ev['location']}\n"
-            + (f"{fights_preview}" if fights_preview else "")
-            + f"[Ver card]({ev['link']})\n\n"
-        )
-
-    await msg.edit_text(
-        text, parse_mode="Markdown", disable_web_page_preview=True
-    )
+        await _send_event_card(update, ev, show_image=True)
 
 
 async def cmd_eventos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -289,19 +375,17 @@ async def cmd_eventos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     now_utc = datetime.now(timezone.utc)
-    upcoming = [
-        e for e in events
-        if e.get("date") and e["date"] >= now_utc
-    ][:6]
+    upcoming = [e for e in events if e.get("date") and e["date"] >= now_utc][:6]
     if not upcoming:
         upcoming = events[:6]
 
     text = "*Proximos Eventos UFC*\n\n"
     for ev in upcoming:
-        date = ev["date"].strftime("%d/%m/%Y") if ev.get("date") else ev["date_str"]
+        date_str = fmt_sp(ev["date"]) if ev.get("date") else ev.get("date_str", "?")
         text += (
             f"*{ev['title']}*\n"
-            f"Data: {date} | Local: {ev['location']}\n"
+            f"Data: {date_str}\n"
+            f"Local: {ev['location']}\n"
             f"[Ver card]({ev['link']})\n\n"
         )
 
@@ -336,22 +420,32 @@ async def cmd_lutador(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    text = f"*{name}* — Proximas lutas:\n\n"
+    await msg.delete()
     for item in found:
         ev = item["event"]
         fight = item["fight"]
-        date = ev["date"].strftime("%d/%m/%Y") if ev.get("date") else "?"
+        date_str = fmt_sp(ev["date"]) if ev.get("date") else "?"
         belt = " _(cinturao)_" if fight["title_fight"] else ""
-        text += (
+        w = f" @{fight['weight']}" if fight["weight"] else ""
+        text = (
             f"*{ev['title']}*\n"
-            f"Data: {date} | Local: {ev['location']}\n"
-            f"*{fight['red']}* vs *{fight['blue']}*{belt}\n"
-            f"[Ver evento]({ev['link']})\n\n"
+            f"Data: {date_str}\n"
+            f"Local: {ev['location']}\n\n"
+            f"*{fight['red']}* vs *{fight['blue']}*{belt}{w}\n\n"
+            f"[Ver evento]({ev['link']})"
         )
-
-    await msg.edit_text(
-        text, parse_mode="Markdown", disable_web_page_preview=True
-    )
+        image_url = await fetch_event_image(ev["link"])
+        if image_url:
+            try:
+                await update.effective_message.reply_photo(
+                    photo=image_url, caption=text, parse_mode="Markdown"
+                )
+                continue
+            except Exception as exc:
+                logger.warning("Falha foto: %s", exc)
+        await update.effective_message.reply_text(
+            text, parse_mode="Markdown", disable_web_page_preview=True
+        )
 
 
 async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
