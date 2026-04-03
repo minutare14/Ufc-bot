@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 from datetime import datetime, timedelta
 
@@ -14,7 +15,17 @@ from telegram.ext import (
     filters,
 )
 
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
+SECRET_TOKEN = os.getenv("SECRET_TOKEN", "")
+PORT = int(os.getenv("PORT", "8765"))
+
 UFC_BASE = "https://www.ufc.com"
 
 HEADERS = {
@@ -340,7 +351,18 @@ def main():
         MessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler)
     )
 
-    app.run_polling(drop_pending_updates=True)
+    if WEBHOOK_URL:
+        logger.info("Iniciando em modo WEBHOOK: %s", WEBHOOK_URL)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            webhook_url=f"{WEBHOOK_URL}/webhook",
+            secret_token=SECRET_TOKEN or None,
+            drop_pending_updates=True,
+        )
+    else:
+        logger.warning("WEBHOOK_URL nao definida — usando polling (fallback).")
+        app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
