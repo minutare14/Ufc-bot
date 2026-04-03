@@ -107,15 +107,13 @@ def _extract_og_image(html: str) -> str | None:
 
 
 async def _reddit_poster(event_title: str) -> str | None:
-    """Busca poster no r/ufc via API pública do Reddit.
-    A comunidade sempre posta o poster oficial antes de cada evento."""
-    # "UFC Fight Night: Moicano vs Duncan" → "Moicano Duncan poster"
+    """Busca poster no r/ufc via API pública do Reddit."""
     names = re.sub(r"UFC\s*(Fight Night|[0-9]+)\s*:?\s*", "", event_title, flags=re.I).strip()
     query = re.sub(r"\s+vs\.?\s+", " ", names, flags=re.I).strip() + " poster"
     encoded = query.replace(" ", "+")
     url = (
         f"https://www.reddit.com/r/ufc/search.json"
-        f"?q={encoded}&sort=new&limit=15&restrict_sr=1&type=link"
+        f"?q={encoded}&sort=relevance&limit=20&restrict_sr=1&type=link"
     )
     reddit_hdrs = {
         "User-Agent": "ufc-telegram-bot/1.0 (Telegram event tracker)",
@@ -128,16 +126,24 @@ async def _reddit_poster(event_title: str) -> str | None:
         data = json.loads(text)
         for post in data.get("data", {}).get("children", []):
             pd = post.get("data", {})
-            # Post de imagem direta (i.redd.it, imgur, etc.)
             post_url = pd.get("url", "")
+            # Imagem direta (i.redd.it, imgur, etc.)
             if re.search(r"\.(jpg|jpeg|png|webp)(\?|$)", post_url, re.I):
-                logger.info("Reddit poster: %s", post_url)
+                logger.info("Reddit direct image: %s", post_url)
                 return post_url
-            # Preview gerado pelo Reddit
+            # i.redd.it sem extensão
+            if "i.redd.it" in post_url:
+                logger.info("Reddit i.redd.it: %s", post_url)
+                return post_url
+            # Preview gerado pelo Reddit (maior resolução)
             for img in pd.get("preview", {}).get("images", [])[:1]:
                 src = img.get("source", {}).get("url", "")
                 if src:
                     return src.replace("&amp;", "&")
+            # Thumbnail (pequena, mas funciona)
+            thumb = pd.get("thumbnail", "")
+            if thumb and thumb.startswith("http"):
+                return thumb
     except Exception as exc:
         logger.warning("Reddit parse error: %s", exc)
     return None
@@ -606,6 +612,17 @@ async def msg_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await cmd_lutador(update, ctx)
 
 
+async def unknown_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Trata qualquer /comando desconhecido como busca de lutador.
+    Ex: /prochazka → busca 'prochazka'; /charles oliveira → busca 'charles oliveira'."""
+    text = update.message.text or ""
+    # Remove a barra e junta o comando + argumentos
+    name = text.lstrip("/").strip()
+    if name:
+        ctx.args = name.split()
+        await cmd_lutador(update, ctx)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -622,9 +639,9 @@ def main():
     app.add_handler(CommandHandler("eventos", cmd_eventos))
     app.add_handler(CommandHandler("lutador", cmd_lutador))
     app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler)
-    )
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler))
+    # Deve ficar por último: captura qualquer /comando não registrado acima
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
     if WEBHOOK_URL:
         logger.info("Iniciando em modo WEBHOOK: %s", WEBHOOK_URL)
