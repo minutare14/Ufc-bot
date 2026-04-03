@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import re
@@ -104,22 +105,52 @@ def _extract_og_image(html: str) -> str | None:
     return None
 
 
-async def fetch_event_image(event_url: str) -> str | None:
-    """Tenta extrair og:image do evento.
-    Tenta primeiro com Googlebot UA (whitelistado pela maioria dos sites),
-    depois com UA de navegador normal."""
-    if not event_url or not event_url.startswith("http"):
+async def _bing_image_search(query: str) -> str | None:
+    """Busca imagem no Bing Images (scraping da página HTML, sem API key)."""
+    encoded = re.sub(r"[^a-zA-Z0-9 ]", "", query).strip().replace(" ", "+")
+    url = f"https://www.bing.com/images/search?q={encoded}&first=1&count=3"
+    html = await fetch_text(url, timeout=8)
+    if not html:
         return None
+    # Bing embute URLs de imagens em JSON dentro de atributos `m='{...}'`
+    m = re.search(r'"iurl"\s*:\s*"(https?://[^"]+)"', html)
+    if m:
+        return m.group(1)
+    return None
 
+
+async def _ufc_og_image(event_url: str) -> str | None:
+    """Tenta og:image do ufc.com com Googlebot e depois UA normal."""
     for hdrs in (GOOGLEBOT_HEADERS, HEADERS):
         html = await fetch_text(event_url, timeout=6, headers=hdrs)
         if html:
             img = _extract_og_image(html)
             if img:
-                logger.info("og:image encontrado: %s", img)
                 return img
+    return None
 
-    logger.warning("Nenhuma imagem encontrada para %s", event_url)
+
+async def fetch_event_image(event_url: str, event_title: str = "") -> str | None:
+    """Busca imagem de múltiplas fontes em paralelo, retorna a primeira que chegar."""
+    sources = []
+    if event_title:
+        sources.append(_bing_image_search(f"{event_title} poster"))
+    if event_url and event_url.startswith("http"):
+        sources.append(_ufc_og_image(event_url))
+
+    if not sources:
+        return None
+
+    for coro in asyncio.as_completed(sources):
+        try:
+            result = await coro
+            if result:
+                logger.info("Imagem obtida: %s", result[:100])
+                return result
+        except Exception as exc:
+            logger.warning("Falha na busca de imagem: %s", exc)
+
+    logger.warning("Nenhuma imagem encontrada para '%s'", event_title)
     return None
 
 
@@ -344,7 +375,7 @@ def build_card_text(ev: dict) -> str:
 
 async def _send_event_card(update: Update, ev: dict) -> None:
     card_text = build_card_text(ev)
-    image_url = await fetch_event_image(ev["link"])
+    image_url = await fetch_event_image(ev["link"], ev.get("title", ""))
 
     if image_url:
         try:
@@ -492,7 +523,7 @@ async def cmd_lutador(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🥊 *{fight['red']}*\n     vs\n🥊 *{fight['blue']}*{belt}{div_str}\n\n"
             f"[Ver evento]({ev['link']})"
         )
-        image_url = await fetch_event_image(ev["link"])
+        image_url = await fetch_event_image(ev["link"], ev.get("title", ""))
         if image_url:
             try:
                 await update.effective_message.reply_photo(
