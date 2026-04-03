@@ -372,14 +372,19 @@ def filter_weekend_events(events: list[dict]) -> list[dict]:
 
 
 def search_fighter(name: str, events: list[dict]) -> list[dict]:
-    name_lower = name.lower()
+    # Divide em palavras (≥2 chars) — cada palavra deve aparecer no nome do lutador.
+    # Isso cobre apelidos no meio do nome: "charles oliveira" acha
+    # 'Charles "Do Bronx" Oliveira' porque "charles" e "oliveira" estão presentes.
+    words = [w for w in name.lower().split() if len(w) >= 2]
+    if not words:
+        return []
+
     found = []
     for ev in events:
         for fight in ev.get("fights", []):
-            if (
-                name_lower in fight["red"].lower()
-                or name_lower in fight["blue"].lower()
-            ):
+            red = fight["red"].lower()
+            blue = fight["blue"].lower()
+            if all(w in red for w in words) or all(w in blue for w in words):
                 found.append({"event": ev, "fight": fight})
     return found
 
