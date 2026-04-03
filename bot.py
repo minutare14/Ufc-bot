@@ -1,7 +1,8 @@
 import asyncio
+import json
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -27,14 +28,18 @@ SECRET_TOKEN = os.getenv("SECRET_TOKEN", "")
 PORT = int(os.getenv("PORT", "8765"))
 
 UFC_BASE = "https://www.ufc.com"
+UFCSTATS_BASE = "https://ufcstats.com"
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        "Chrome/124.0.0.0 Safari/537.36"
     ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
 }
 
 
@@ -49,70 +54,181 @@ async def fetch_html(url: str) -> str | None:
             async with session.get(
                 url, timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
+                logger.info("GET %s → %s", url, resp.status)
                 if resp.status == 200:
                     return await resp.text()
+                logger.warning("Status inesperado %s para %s", resp.status, url)
     except Exception as exc:
-        print(f"Erro ao buscar {url}: {exc}")
+        logger.error("Erro ao buscar %s: %s", url, exc)
     return None
 
 
 # ---------------------------------------------------------------------------
-# Scraper
+# Scraper — fonte primária: ufcstats.com
 # ---------------------------------------------------------------------------
 
 
-def parse_events(html: str) -> list[dict]:
+def _parse_date(raw: str) -> datetime | None:
+    """Tenta parsear datas nos formatos usados pelo ufcstats e ufc.com."""
+    raw = raw.strip()
+    for fmt in ("%B %d, %Y", "%b %d, %Y", "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    # ISO com offset (ufc.com)
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        pass
+    return None
+
+
+def parse_events_ufcstats(html: str) -> list[dict]:
+    """Parseia eventos de ufcstats.com/statistics/events/upcoming."""
     soup = BeautifulSoup(html, "lxml")
     events = []
 
-    cards = soup.select("article.c-card-event--result")
+    rows = soup.select("tr.b-statistics__table-row")
+    logger.info("ufcstats: %d linhas encontradas", len(rows))
 
-    for card in cards:
-        title_el = card.select_one(".c-card-event--result__headline")
-        date_el = card.select_one("time")
-        loc_el = card.select_one(".c-card-event--result__location")
-        link_el = card.select_one("a[href]")
+    for row in rows:
+        cols = row.select("td.b-statistics__table-col")
+        if len(cols) < 3:
+            continue
 
-        title = title_el.get_text(strip=True) if title_el else "Evento UFC"
-        date_str = date_el.get("datetime", "") if date_el else ""
-        location = loc_el.get_text(strip=True) if loc_el else "A confirmar"
-        link = UFC_BASE + link_el["href"] if link_el else ""
+        link_el = cols[0].select_one("a")
+        if not link_el:
+            continue
 
-        event_date = None
-        try:
-            event_date = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-        except Exception:
-            pass
+        title = link_el.get_text(strip=True)
+        link = link_el.get("href", "")
+        date_raw = cols[1].get_text(strip=True)
+        location = cols[2].get_text(strip=True)
+        event_date = _parse_date(date_raw)
 
         events.append(
             {
                 "title": title,
                 "date": event_date,
-                "date_str": date_str,
+                "date_str": date_raw,
                 "location": location,
                 "link": link,
             }
         )
 
+    logger.info("ufcstats: %d eventos parseados", len(events))
     return events
 
 
+def parse_events_ufc_jsonld(html: str) -> list[dict]:
+    """Extrai eventos do JSON-LD embutido nas páginas do ufc.com."""
+    soup = BeautifulSoup(html, "lxml")
+    events = []
+
+    for script in soup.select('script[type="application/ld+json"]'):
+        try:
+            data = json.loads(script.string or "")
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                if item.get("@type") not in ("SportsEvent", "Event"):
+                    continue
+                title = item.get("name", "Evento UFC")
+                date_raw = item.get("startDate", "")
+                location_obj = item.get("location", {})
+                location = (
+                    location_obj.get("name", "A confirmar")
+                    if isinstance(location_obj, dict)
+                    else str(location_obj)
+                )
+                url = item.get("url", "")
+                event_date = _parse_date(date_raw)
+                events.append(
+                    {
+                        "title": title,
+                        "date": event_date,
+                        "date_str": date_raw,
+                        "location": location,
+                        "link": url,
+                    }
+                )
+        except Exception:
+            pass
+
+    # fallback: seletores CSS legados do ufc.com
+    if not events:
+        cards = soup.select("article.c-card-event--result")
+        logger.info("ufc.com CSS fallback: %d cards encontrados", len(cards))
+        for card in cards:
+            title_el = card.select_one(".c-card-event--result__headline")
+            date_el = card.select_one("time")
+            loc_el = card.select_one(".c-card-event--result__location")
+            link_el = card.select_one("a[href]")
+
+            title = title_el.get_text(strip=True) if title_el else "Evento UFC"
+            date_str = date_el.get("datetime", "") if date_el else ""
+            location = loc_el.get_text(strip=True) if loc_el else "A confirmar"
+            link = UFC_BASE + link_el["href"] if link_el else ""
+            event_date = _parse_date(date_str)
+
+            events.append(
+                {
+                    "title": title,
+                    "date": event_date,
+                    "date_str": date_str,
+                    "location": location,
+                    "link": link,
+                }
+            )
+
+    logger.info("ufc.com: %d eventos extraídos (JSON-LD + CSS)", len(events))
+    return events
+
+
+async def get_events() -> list[dict]:
+    """Busca eventos: tenta ufcstats primeiro, depois ufc.com."""
+    html = await fetch_html(f"{UFCSTATS_BASE}/statistics/events/upcoming")
+    if html:
+        events = parse_events_ufcstats(html)
+        if events:
+            return events
+
+    logger.warning("ufcstats falhou ou vazio — tentando ufc.com")
+    html = await fetch_html(f"{UFC_BASE}/events")
+    if html:
+        return parse_events_ufc_jsonld(html)
+
+    return []
+
+
 def filter_weekend_events(events: list[dict]) -> list[dict]:
-    today = datetime.now()
+    now_utc = datetime.now(timezone.utc)
+    today = now_utc.date()
     days_until_saturday = (5 - today.weekday()) % 7 or 7
     next_saturday = today + timedelta(days=days_until_saturday)
     next_sunday = next_saturday + timedelta(days=1)
 
+    logger.info(
+        "Filtrando fim de semana: %s a %s (hoje=%s)",
+        next_saturday, next_sunday, today,
+    )
+
+    def event_date(e: dict):
+        d = e.get("date")
+        if d is None:
+            return None
+        return d.replace(tzinfo=timezone.utc) if d.tzinfo is None else d
+
     weekend = [
-        e
-        for e in events
-        if e.get("date")
-        and next_saturday.date() <= e["date"].date() <= next_sunday.date()
+        e for e in events
+        if event_date(e) and next_saturday <= event_date(e).date() <= next_sunday
     ]
 
     if not weekend:
+        logger.info("Nenhum evento no FDS — usando fallback (próximos 3)")
         weekend = [
-            e for e in events if e.get("date") and e["date"] > today
+            e for e in events
+            if event_date(e) and event_date(e) >= now_utc
         ][:3]
 
     return weekend
@@ -195,12 +311,11 @@ async def cmd_fds(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Buscando eventos do fim de semana..."
     )
 
-    html = await fetch_html(f"{UFC_BASE}/events")
-    if not html:
-        await msg.edit_text("Nao consegui acessar ufc.com.")
+    events = await get_events()
+    if not events:
+        await msg.edit_text("Nao consegui obter eventos. Tente novamente.")
         return
 
-    events = parse_events(html)
     weekend = filter_weekend_events(events)
 
     if not weekend:
@@ -210,7 +325,7 @@ async def cmd_fds(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = "*Eventos UFC — Proximo Fim de Semana*\n\n"
     for ev in weekend:
         date = (
-            ev["date"].strftime("%d/%m/%Y %H:%M")
+            ev["date"].strftime("%d/%m/%Y %H:%M UTC")
             if ev.get("date")
             else ev["date_str"]
         )
@@ -229,20 +344,23 @@ async def cmd_fds(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_eventos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.effective_message.reply_text("Buscando eventos...")
 
-    html = await fetch_html(f"{UFC_BASE}/events")
-    if not html:
-        await msg.edit_text("Nao consegui acessar ufc.com.")
+    events = await get_events()
+    if not events:
+        await msg.edit_text("Nao consegui obter eventos. Tente novamente.")
         return
 
-    events = parse_events(html)
-    now = datetime.now()
-    upcoming = [e for e in events if not e.get("date") or e["date"] >= now][
-        :6
-    ]
+    now_utc = datetime.now(timezone.utc)
 
+    def is_future(e: dict) -> bool:
+        d = e.get("date")
+        if d is None:
+            return True
+        d = d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+        return d >= now_utc
+
+    upcoming = [e for e in events if is_future(e)][:6]
     if not upcoming:
-        await msg.edit_text("Nenhum evento futuro encontrado.")
-        return
+        upcoming = events[:6]
 
     text = "*Proximos Eventos UFC*\n\n"
     for ev in upcoming:
@@ -275,15 +393,12 @@ async def cmd_lutador(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Buscando *{name}*...", parse_mode="Markdown"
     )
 
-    html = await fetch_html(f"{UFC_BASE}/events")
-    if not html:
-        await msg.edit_text("Erro ao acessar ufc.com.")
+    events = await get_events()
+    if not events:
+        await msg.edit_text("Erro ao buscar eventos.")
         return
 
-    events = parse_events(html)
-    now = datetime.now()
-    future = [e for e in events if not e.get("date") or e["date"] >= now]
-    found_fights = await search_fighter_in_events(name, future)
+    found_fights = await search_fighter_in_events(name, events)
 
     if not found_fights:
         await msg.edit_text(
