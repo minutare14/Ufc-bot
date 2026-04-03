@@ -26,11 +26,10 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 SECRET_TOKEN = os.getenv("SECRET_TOKEN", "")
 PORT = int(os.getenv("PORT", "8765"))
 
-UFC_ICS_URL = (
-    "https://raw.githubusercontent.com/clarencechaan/ufc-cal/ics/UFC.ics"
-)
+UFC_ICS_URL = "https://raw.githubusercontent.com/clarencechaan/ufc-cal/ics/UFC.ics"
 SP_TZ = ZoneInfo("America/Sao_Paulo")
 
+# Headers padrão para busca do ICS
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -41,15 +40,47 @@ HEADERS = {
     "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8",
 }
 
+# Headers de Googlebot — sites whitelistam para indexação SEO
+GOOGLEBOT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+    ),
+    "Accept": "text/html,application/xhtml+xml,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+DAYS_PT = {
+    0: "Segunda-feira",
+    1: "Terça-feira",
+    2: "Quarta-feira",
+    3: "Quinta-feira",
+    4: "Sexta-feira",
+    5: "Sábado",
+    6: "Domingo",
+}
+
+DIVISIONS = {
+    "115": "Palha",
+    "125": "Mosca",
+    "135": "Galo",
+    "145": "Pena",
+    "155": "Leve",
+    "170": "Meio-Médio",
+    "185": "Médio",
+    "205": "Meio-Pesado",
+    "265": "Pesado",
+}
+
 
 # ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
 
 
-async def fetch_text(url: str, timeout: int = 15) -> str | None:
+async def fetch_text(url: str, timeout: int = 15, headers: dict | None = None) -> str | None:
+    hdrs = headers or HEADERS
     try:
-        async with aiohttp.ClientSession(headers=HEADERS) as session:
+        async with aiohttp.ClientSession(headers=hdrs) as session:
             async with session.get(
                 url, timeout=aiohttp.ClientTimeout(total=timeout)
             ) as resp:
@@ -62,36 +93,52 @@ async def fetch_text(url: str, timeout: int = 15) -> str | None:
     return None
 
 
-async def fetch_event_image(event_url: str) -> str | None:
-    """Extrai og:image da página do evento (timeout curto para não travar)."""
-    if not event_url or not event_url.startswith("http"):
-        return None
-    html = await fetch_text(event_url, timeout=5)
-    if not html:
-        return None
+def _extract_og_image(html: str) -> str | None:
     for pattern in (
         r'property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
         r'content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
     ):
         m = re.search(pattern, html, re.IGNORECASE)
         if m:
-            url = m.group(1)
-            logger.info("og:image: %s", url)
-            return url
+            return m.group(1)
+    return None
+
+
+async def fetch_event_image(event_url: str) -> str | None:
+    """Tenta extrair og:image do evento.
+    Tenta primeiro com Googlebot UA (whitelistado pela maioria dos sites),
+    depois com UA de navegador normal."""
+    if not event_url or not event_url.startswith("http"):
+        return None
+
+    for hdrs in (GOOGLEBOT_HEADERS, HEADERS):
+        html = await fetch_text(event_url, timeout=6, headers=hdrs)
+        if html:
+            img = _extract_og_image(html)
+            if img:
+                logger.info("og:image encontrado: %s", img)
+                return img
+
+    logger.warning("Nenhuma imagem encontrada para %s", event_url)
     return None
 
 
 # ---------------------------------------------------------------------------
-# Timezone helper
+# Formatação
 # ---------------------------------------------------------------------------
 
 
 def fmt_sp(dt: datetime) -> str:
-    """Converte UTC para horário de São Paulo e formata."""
+    """Converte UTC → São Paulo e retorna string legível em pt-BR."""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     dt_sp = dt.astimezone(SP_TZ)
-    return dt_sp.strftime("%d/%m/%Y %H:%M (Brasília)")
+    day_name = DAYS_PT[dt_sp.weekday()]
+    return dt_sp.strftime(f"{day_name}, %d/%m/%Y às %H:%M (Brasília)")
+
+
+def weight_label(w: str) -> str:
+    return DIVISIONS.get(w.strip(), f"@{w}" if w else "")
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +161,6 @@ def _unescape_ics(value: str) -> str:
 
 
 def _parse_fights_from_description(desc: str) -> list[dict]:
-    """Extrai todas as lutas do card separando Main Card de Prelims."""
     fights = []
     section = "main"
     for line in desc.splitlines():
@@ -143,8 +189,8 @@ def _parse_fights_from_description(desc: str) -> list[dict]:
             blue = blue_weight
         fights.append(
             {
-                "red": red[:60],
-                "blue": blue[:60],
+                "red": red[:70],
+                "blue": blue[:70],
                 "weight": weight,
                 "title_fight": "(C)" in red or "(C)" in blue,
                 "section": section,
@@ -254,39 +300,87 @@ def search_fighter(name: str, events: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Formatação do card completo
+# Montagem do card
 # ---------------------------------------------------------------------------
 
 
 def build_card_text(ev: dict) -> str:
-    """Monta o texto completo do card com todas as lutas."""
+    date_str = fmt_sp(ev["date"]) if ev.get("date") else ev.get("date_str", "?")
     fights = ev.get("fights", [])
     main = [f for f in fights if f["section"] == "main"]
     prelims = [f for f in fights if f["section"] == "prelim"]
 
-    date_str = fmt_sp(ev["date"]) if ev.get("date") else ev.get("date_str", "?")
-
-    text = (
-        f"*{ev['title']}*\n"
-        f"Data: {date_str}\n"
-        f"Local: {ev['location']}\n"
-    )
+    text = f"*{ev['title']}*\n"
+    text += f"📅 {date_str}\n"
+    text += f"📍 {ev['location']}\n"
 
     if main:
-        text += "\n*Main Card*\n"
-        for f in main:
-            belt = " C" if f["title_fight"] else ""
-            w = f" @{f['weight']}" if f["weight"] else ""
-            text += f"• {f['red']} vs {f['blue']}{belt}{w}\n"
+        text += "\n*— Main Card —*\n"
+        for i, f in enumerate(main):
+            div = weight_label(f["weight"])
+            belt = " 🏆" if f["title_fight"] else ""
+            div_str = f"  _{div}_" if div else ""
+            if i == 0:
+                # Luta principal em destaque
+                text += f"\n🥊 *{f['red']}*\n     vs\n🥊 *{f['blue']}*{belt}{div_str}\n\n"
+            else:
+                text += f"• {f['red']} vs {f['blue']}{belt}{div_str}\n"
 
     if prelims:
-        text += "\n*Prelims*\n"
+        text += "\n*— Prelims —*\n"
         for f in prelims:
-            w = f" @{f['weight']}" if f["weight"] else ""
-            text += f"• {f['red']} vs {f['blue']}{w}\n"
+            div = weight_label(f["weight"])
+            div_str = f"  _{div}_" if div else ""
+            text += f"• {f['red']} vs {f['blue']}{div_str}\n"
 
     text += f"\n[Ver card completo]({ev['link']})"
     return text
+
+
+# ---------------------------------------------------------------------------
+# Envio do card com imagem
+# ---------------------------------------------------------------------------
+
+
+async def _send_event_card(update: Update, ev: dict) -> None:
+    card_text = build_card_text(ev)
+    image_url = await fetch_event_image(ev["link"])
+
+    if image_url:
+        try:
+            if len(card_text) <= 1024:
+                await update.effective_message.reply_photo(
+                    photo=image_url,
+                    caption=card_text,
+                    parse_mode="Markdown",
+                )
+            else:
+                # Foto com título + data; card completo como mensagem seguinte
+                header = (
+                    f"*{ev['title']}*\n"
+                    f"📅 {fmt_sp(ev['date']) if ev.get('date') else ev.get('date_str','')}\n"
+                    f"📍 {ev['location']}"
+                )
+                await update.effective_message.reply_photo(
+                    photo=image_url,
+                    caption=header,
+                    parse_mode="Markdown",
+                )
+                await update.effective_message.reply_text(
+                    card_text,
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True,
+                )
+            return
+        except Exception as exc:
+            logger.warning("Falha ao enviar foto: %s", exc)
+
+    # Fallback: só texto
+    await update.effective_message.reply_text(
+        card_text,
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +396,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text(
         "*UFC Bot*\n\n"
-        "`/fds` — Eventos do próximo fim de semana\n"
+        "`/fds` — Card do próximo fim de semana\n"
         "`/eventos` — Próximos eventos\n"
         "`/lutador [nome]` — Quando um lutador vai lutar",
         parse_mode="Markdown",
@@ -310,60 +404,22 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def _send_event_card(
-    update: Update, ev: dict, show_image: bool = True
-) -> None:
-    """Envia um evento completo: imagem (se disponível) + card com todas as lutas."""
-    card_text = build_card_text(ev)
-
-    image_url = await fetch_event_image(ev["link"]) if show_image else None
-
-    if image_url:
-        try:
-            # Caption limitado a 1024 chars pelo Telegram
-            caption = card_text[:1024]
-            await update.effective_message.reply_photo(
-                photo=image_url,
-                caption=caption,
-                parse_mode="Markdown",
-            )
-            # Se o card foi cortado, envia o resto como mensagem separada
-            if len(card_text) > 1024:
-                await update.effective_message.reply_text(
-                    card_text[1024:],
-                    parse_mode="Markdown",
-                    disable_web_page_preview=True,
-                )
-            return
-        except Exception as exc:
-            logger.warning("Falha ao enviar foto, fallback texto: %s", exc)
-
-    # Fallback sem imagem
-    await update.effective_message.reply_text(
-        card_text,
-        parse_mode="Markdown",
-        disable_web_page_preview=True,
-    )
-
-
 async def cmd_fds(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = await update.effective_message.reply_text(
-        "Buscando eventos do fim de semana..."
-    )
+    msg = await update.effective_message.reply_text("Buscando card do fim de semana...")
 
     events = await get_events()
     if not events:
-        await msg.edit_text("Nao consegui obter eventos. Tente novamente.")
+        await msg.edit_text("Não consegui obter eventos. Tente novamente.")
         return
 
     weekend = filter_weekend_events(events)
     if not weekend:
-        await msg.edit_text("Nenhum evento no proximo fim de semana.")
+        await msg.edit_text("Nenhum evento no próximo fim de semana.")
         return
 
     await msg.delete()
     for ev in weekend:
-        await _send_event_card(update, ev, show_image=True)
+        await _send_event_card(update, ev)
 
 
 async def cmd_eventos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -371,7 +427,7 @@ async def cmd_eventos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     events = await get_events()
     if not events:
-        await msg.edit_text("Nao consegui obter eventos. Tente novamente.")
+        await msg.edit_text("Não consegui obter eventos. Tente novamente.")
         return
 
     now_utc = datetime.now(timezone.utc)
@@ -379,13 +435,13 @@ async def cmd_eventos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not upcoming:
         upcoming = events[:6]
 
-    text = "*Proximos Eventos UFC*\n\n"
+    text = "*Próximos Eventos UFC*\n\n"
     for ev in upcoming:
         date_str = fmt_sp(ev["date"]) if ev.get("date") else ev.get("date_str", "?")
         text += (
             f"*{ev['title']}*\n"
-            f"Data: {date_str}\n"
-            f"Local: {ev['location']}\n"
+            f"📅 {date_str}\n"
+            f"📍 {ev['location']}\n"
             f"[Ver card]({ev['link']})\n\n"
         )
 
@@ -415,7 +471,7 @@ async def cmd_lutador(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     found = search_fighter(name, events)
     if not found:
         await msg.edit_text(
-            f"*{name}* nao encontrado em proximos eventos.\n\nVeja todos com /eventos",
+            f"*{name}* não encontrado em próximos eventos.\n\nVeja todos com /eventos",
             parse_mode="Markdown",
         )
         return
@@ -425,13 +481,15 @@ async def cmd_lutador(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ev = item["event"]
         fight = item["fight"]
         date_str = fmt_sp(ev["date"]) if ev.get("date") else "?"
-        belt = " _(cinturao)_" if fight["title_fight"] else ""
-        w = f" @{fight['weight']}" if fight["weight"] else ""
+        div = weight_label(fight["weight"])
+        belt = " 🏆" if fight["title_fight"] else ""
+        div_str = f"\n_{div}_" if div else ""
+
         text = (
             f"*{ev['title']}*\n"
-            f"Data: {date_str}\n"
-            f"Local: {ev['location']}\n\n"
-            f"*{fight['red']}* vs *{fight['blue']}*{belt}{w}\n\n"
+            f"📅 {date_str}\n"
+            f"📍 {ev['location']}\n\n"
+            f"🥊 *{fight['red']}*\n     vs\n🥊 *{fight['blue']}*{belt}{div_str}\n\n"
             f"[Ver evento]({ev['link']})"
         )
         image_url = await fetch_event_image(ev["link"])
@@ -476,7 +534,7 @@ async def msg_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if not TELEGRAM_TOKEN:
-        raise RuntimeError("TELEGRAM_TOKEN nao definido.")
+        raise RuntimeError("TELEGRAM_TOKEN não definido.")
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
@@ -500,7 +558,7 @@ def main():
             drop_pending_updates=True,
         )
     else:
-        logger.warning("WEBHOOK_URL nao definida — usando polling (fallback).")
+        logger.warning("WEBHOOK_URL não definida — usando polling (fallback).")
         app.run_polling(drop_pending_updates=True)
 
 
