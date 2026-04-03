@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import re
@@ -105,17 +106,66 @@ def _extract_og_image(html: str) -> str | None:
     return None
 
 
+async def _reddit_poster(event_title: str) -> str | None:
+    """Busca poster no r/ufc via API pública do Reddit.
+    A comunidade sempre posta o poster oficial antes de cada evento."""
+    # "UFC Fight Night: Moicano vs Duncan" → "Moicano Duncan poster"
+    names = re.sub(r"UFC\s*(Fight Night|[0-9]+)\s*:?\s*", "", event_title, flags=re.I).strip()
+    query = re.sub(r"\s+vs\.?\s+", " ", names, flags=re.I).strip() + " poster"
+    encoded = query.replace(" ", "+")
+    url = (
+        f"https://www.reddit.com/r/ufc/search.json"
+        f"?q={encoded}&sort=new&limit=15&restrict_sr=1&type=link"
+    )
+    reddit_hdrs = {
+        "User-Agent": "ufc-telegram-bot/1.0 (Telegram event tracker)",
+        "Accept": "application/json",
+    }
+    text = await fetch_text(url, timeout=10, headers=reddit_hdrs)
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+        for post in data.get("data", {}).get("children", []):
+            pd = post.get("data", {})
+            # Post de imagem direta (i.redd.it, imgur, etc.)
+            post_url = pd.get("url", "")
+            if re.search(r"\.(jpg|jpeg|png|webp)(\?|$)", post_url, re.I):
+                logger.info("Reddit poster: %s", post_url)
+                return post_url
+            # Preview gerado pelo Reddit
+            for img in pd.get("preview", {}).get("images", [])[:1]:
+                src = img.get("source", {}).get("url", "")
+                if src:
+                    return src.replace("&amp;", "&")
+    except Exception as exc:
+        logger.warning("Reddit parse error: %s", exc)
+    return None
+
+
 async def _bing_image_search(query: str) -> str | None:
-    """Busca imagem no Bing Images (scraping da página HTML, sem API key)."""
+    """Busca imagem no Bing Images (scraping, sem API key)."""
     encoded = re.sub(r"[^a-zA-Z0-9 ]", "", query).strip().replace(" ", "+")
     url = f"https://www.bing.com/images/search?q={encoded}&first=1&count=3"
-    html = await fetch_text(url, timeout=8)
+    bing_hdrs = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.bing.com/",
+    }
+    html = await fetch_text(url, timeout=8, headers=bing_hdrs)
     if not html:
         return None
-    # Bing embute URLs de imagens em JSON dentro de atributos `m='{...}'`
-    m = re.search(r'"iurl"\s*:\s*"(https?://[^"]+)"', html)
-    if m:
-        return m.group(1)
+    # Bing embute dados de imagem em JSON: {"iurl":"...","murl":"..."}
+    for field in ("iurl", "murl"):
+        m = re.search(rf'"{field}"\s*:\s*"(https?://[^"]+)"', html)
+        if m:
+            logger.info("Bing %s: %s", field, m.group(1)[:100])
+            return m.group(1)
     return None
 
 
@@ -131,15 +181,13 @@ async def _ufc_og_image(event_url: str) -> str | None:
 
 
 async def fetch_event_image(event_url: str, event_title: str = "") -> str | None:
-    """Busca imagem de múltiplas fontes em paralelo, retorna a primeira que chegar."""
+    """Busca imagem em três fontes em paralelo — retorna a primeira válida."""
     sources = []
     if event_title:
-        sources.append(_bing_image_search(f"{event_title} poster"))
+        sources.append(_reddit_poster(event_title))       # 1ª: Reddit r/ufc
+        sources.append(_bing_image_search(f"{event_title} fight poster"))  # 2ª: Bing
     if event_url and event_url.startswith("http"):
-        sources.append(_ufc_og_image(event_url))
-
-    if not sources:
-        return None
+        sources.append(_ufc_og_image(event_url))          # 3ª: UFC.com
 
     for coro in asyncio.as_completed(sources):
         try:
